@@ -16,12 +16,20 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import yaml
+
+# Ensure project root is importable when script is executed directly.
+_THIS_FILE = Path(__file__).resolve()
+_PROJECT_ROOT_FOR_IMPORT = _THIS_FILE.parents[2]
+if str(_PROJECT_ROOT_FOR_IMPORT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT_FOR_IMPORT))
 
 from benchmark.data_generation.profile_generator import generate_profiles_for_kb
 from benchmark.data_generation.scope_generator import generate_knowledge_scope
@@ -85,6 +93,11 @@ def _cleanup_failed_kb_data(kb_base_dir: Path, kb_name: str, output_dir: Path) -
             logger.warning("Failed to remove KB directory %s: %s", kb_dir, e)
 
 
+def _parse_gpu_ids(raw: str) -> list[str]:
+    ids = [p.strip() for p in raw.split(",") if p.strip()]
+    return ids or ["0"]
+
+
 async def _process_pdf(
     *,
     pdf_path: Path,
@@ -94,6 +107,9 @@ async def _process_pdf(
     rag_cfg: dict,
     output_dir: Path,
     skip_extract: bool,
+    use_mineru_api: bool,
+    mineru_api_token: str | None,
+    mineru_model_version: str,
 ) -> dict:
     """Initialize KB from one PDF and generate profiles."""
     logger.info("=" * 70)
@@ -110,7 +126,11 @@ async def _process_pdf(
     if not copied:
         raise RuntimeError(f"Failed to copy PDF: {pdf_path}")
 
-    await initializer.process_documents()
+    await initializer.process_documents(
+        use_mineru_api=use_mineru_api,
+        mineru_api_token=mineru_api_token,
+        mineru_model_version=mineru_model_version,
+    )
     if not skip_extract:
         initializer.extract_numbered_items()
 
@@ -143,7 +163,7 @@ async def _process_pdf(
     return out
 
 
-async def _process_pdf_guarded(
+async def _run_single_pdf_child(
     *,
     pdf_path: Path,
     kb_name: str,
@@ -152,35 +172,129 @@ async def _process_pdf_guarded(
     rag_cfg: dict,
     output_dir: Path,
     skip_extract: bool,
-    semaphore: asyncio.Semaphore,
-    fail_event: asyncio.Event,
-) -> dict | None:
-    """Run one PDF pipeline with fail-fast cleanup semantics."""
-    if fail_event.is_set():
-        return None
+    use_mineru_api: bool,
+    mineru_api_token: str | None,
+    mineru_model_version: str,
+) -> None:
+    """Run one PDF pipeline in child process; cleanup and fail on error."""
+    try:
+        await _process_pdf(
+            pdf_path=pdf_path,
+            kb_name=kb_name,
+            kb_base_dir=kb_base_dir,
+            profile_cfg=profile_cfg,
+            rag_cfg=rag_cfg,
+            output_dir=output_dir,
+            skip_extract=skip_extract,
+            use_mineru_api=use_mineru_api,
+            mineru_api_token=mineru_api_token,
+            mineru_model_version=mineru_model_version,
+        )
+    except Exception as e:
+        logger.exception("Failed on %s -> %s: %s", pdf_path.name, kb_name, e)
+        _cleanup_failed_kb_data(kb_base_dir=kb_base_dir, kb_name=kb_name, output_dir=output_dir)
+        raise PipelineAbortError(
+            f"Pipeline failed for {pdf_path.name} (kb={kb_name}). Program terminated."
+        ) from e
 
-    async with semaphore:
-        if fail_event.is_set():
-            return None
-        try:
-            return await _process_pdf(
-                pdf_path=pdf_path,
-                kb_name=kb_name,
-                kb_base_dir=kb_base_dir,
-                profile_cfg=profile_cfg,
-                rag_cfg=rag_cfg,
-                output_dir=output_dir,
-                skip_extract=skip_extract,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.exception("Failed on %s -> %s: %s", pdf_path.name, kb_name, e)
-            _cleanup_failed_kb_data(kb_base_dir=kb_base_dir, kb_name=kb_name, output_dir=output_dir)
-            fail_event.set()
-            raise PipelineAbortError(
-                f"Pipeline failed for {pdf_path.name} (kb={kb_name}). Program terminated."
-            ) from e
+
+async def _run_jobs_with_gpu_sharding(
+    *,
+    jobs: list[tuple[Path, str]],
+    gpu_ids: list[str],
+    config_path: Path,
+    output_dir: Path,
+    skip_extract: bool,
+    use_mineru_api: bool,
+    mineru_api_token: str | None,
+    mineru_model_version: str,
+) -> list[dict]:
+    """Run jobs as child processes pinned to GPUs with fail-fast behavior."""
+    available_gpus = list(gpu_ids)
+    running: list[dict] = []
+    waiting_jobs = list(jobs)
+    results: list[dict] = []
+
+    async def _start_one(pdf_path: Path, kb_name: str, gpu_id: str) -> dict:
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--single-pdf",
+            str(pdf_path),
+            "--single-kb-name",
+            kb_name,
+            "--single-output-dir",
+            str(output_dir),
+            "--config",
+            str(config_path),
+            "--mineru-model-version",
+            mineru_model_version,
+            "--gpu-ids",
+            gpu_id,
+        ]
+        if skip_extract:
+            cmd.append("--skip-extract")
+        if use_mineru_api:
+            cmd.append("--use-mineru-api")
+        else:
+            cmd.append("--no-use-mineru-api")
+        if mineru_api_token:
+            cmd.extend(["--mineru-api-token", mineru_api_token])
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = gpu_id
+        logger.info("Spawn %s on GPU %s", kb_name, gpu_id)
+        proc = await asyncio.create_subprocess_exec(*cmd, env=env)
+        wait_task = asyncio.create_task(proc.wait())
+        return {
+            "pdf_path": pdf_path,
+            "kb_name": kb_name,
+            "gpu_id": gpu_id,
+            "proc": proc,
+            "wait_task": wait_task,
+        }
+
+    while waiting_jobs or running:
+        while waiting_jobs and available_gpus:
+            pdf_path, kb_name = waiting_jobs.pop(0)
+            gpu_id = available_gpus.pop(0)
+            running.append(await _start_one(pdf_path, kb_name, gpu_id))
+
+        if not running:
+            break
+
+        done, _ = await asyncio.wait(
+            [r["wait_task"] for r in running],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        finished_entries = [r for r in running if r["wait_task"] in done]
+        for entry in finished_entries:
+            running.remove(entry)
+            available_gpus.append(entry["gpu_id"])
+
+            exit_code = entry["wait_task"].result()
+            if exit_code != 0:
+                logger.error(
+                    "Job failed: %s (pdf=%s) on GPU %s, exit_code=%s",
+                    entry["kb_name"],
+                    entry["pdf_path"].name,
+                    entry["gpu_id"],
+                    exit_code,
+                )
+                for other in running:
+                    other["proc"].terminate()
+                await asyncio.gather(*[r["wait_task"] for r in running], return_exceptions=True)
+                raise PipelineAbortError(
+                    f"Pipeline failed for {entry['pdf_path'].name} (kb={entry['kb_name']})."
+                )
+
+            output_json = output_dir / f"{entry['kb_name']}.json"
+            if output_json.exists():
+                with open(output_json, encoding="utf-8") as f:
+                    results.append(json.load(f))
+
+    return results
 
 
 async def main() -> None:
@@ -208,18 +322,36 @@ async def main() -> None:
         default=0,
         help="Only process first N PDFs (0 = all)",
     )
+    parser.add_argument(
+        "--use-mineru-api",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use MinerU cloud API for parsing (default: True). Use --no-use-mineru-api for local parser.",
+    )
+    parser.add_argument(
+        "--mineru-api-token",
+        default=None,
+        help="MinerU API token (falls back to MINERU_API_TOKEN env var if omitted).",
+    )
+    parser.add_argument(
+        "--mineru-model-version",
+        default="vlm",
+        help='MinerU API model version (default: "vlm").',
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        default="0,1,2,3",
+        help='GPU ids for sharding workloads, comma-separated (default: "0,1,2,3").',
+    )
+    parser.add_argument("--single-pdf", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--single-kb-name", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--single-output-dir", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-
-    docs_dir = Path(args.docs_dir)
-    if not docs_dir.is_absolute():
-        docs_dir = (PROJECT_ROOT / docs_dir).resolve()
-    if not docs_dir.exists():
-        raise FileNotFoundError(f"Documents dir not found: {docs_dir}")
 
     cfg_path = Path(args.config)
     if not cfg_path.is_absolute():
@@ -234,6 +366,32 @@ async def main() -> None:
 
     profile_cfg = cfg.get("profile_generation", {})
     rag_cfg = cfg.get("rag_query", {})
+
+    if args.single_pdf:
+        if not args.single_kb_name or not args.single_output_dir:
+            raise ValueError("--single-pdf mode requires --single-kb-name and --single-output-dir")
+        pdf_path = Path(args.single_pdf).resolve()
+        output_dir = Path(args.single_output_dir).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        await _run_single_pdf_child(
+            pdf_path=pdf_path,
+            kb_name=args.single_kb_name,
+            kb_base_dir=kb_base_dir,
+            profile_cfg=profile_cfg,
+            rag_cfg=rag_cfg,
+            output_dir=output_dir,
+            skip_extract=args.skip_extract,
+            use_mineru_api=args.use_mineru_api,
+            mineru_api_token=args.mineru_api_token,
+            mineru_model_version=args.mineru_model_version,
+        )
+        return
+
+    docs_dir = Path(args.docs_dir)
+    if not docs_dir.is_absolute():
+        docs_dir = (PROJECT_ROOT / docs_dir).resolve()
+    if not docs_dir.exists():
+        raise FileNotFoundError(f"Documents dir not found: {docs_dir}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = PROJECT_ROOT / "benchmark" / "data" / "generated" / f"profiles_from_documents_{timestamp}"
@@ -251,48 +409,26 @@ async def main() -> None:
         kb_name = _unique_name(_sanitize_kb_name(pdf.stem), used_names)
         jobs.append((pdf, kb_name))
 
-    logger.info("Starting pipelines with max concurrency = %d", MAX_CONCURRENCY)
-    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-    fail_event = asyncio.Event()
-    tasks = [
-        asyncio.create_task(
-            _process_pdf_guarded(
-                pdf_path=pdf,
-                kb_name=kb_name,
-                kb_base_dir=kb_base_dir,
-                profile_cfg=profile_cfg,
-                rag_cfg=rag_cfg,
-                output_dir=output_dir,
-                skip_extract=args.skip_extract,
-                semaphore=semaphore,
-                fail_event=fail_event,
-            ),
-            name=kb_name,
+    gpu_ids = _parse_gpu_ids(args.gpu_ids)
+    logger.info("Starting pipelines with max concurrency = %d", min(MAX_CONCURRENCY, len(gpu_ids)))
+    logger.info("GPU sharding enabled on ids: %s", ",".join(gpu_ids))
+    logger.info(
+        "Parser mode: %s",
+        "MinerU cloud API" if args.use_mineru_api else "local parser",
+    )
+    try:
+        results = await _run_jobs_with_gpu_sharding(
+            jobs=jobs,
+            gpu_ids=gpu_ids[:MAX_CONCURRENCY],
+            config_path=cfg_path,
+            output_dir=output_dir,
+            skip_extract=args.skip_extract,
+            use_mineru_api=args.use_mineru_api,
+            mineru_api_token=args.mineru_api_token,
+            mineru_model_version=args.mineru_model_version,
         )
-        for pdf, kb_name in jobs
-    ]
-
-    results = []
-    pending = set(tasks)
-    fatal_error: Exception | None = None
-    while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_EXCEPTION)
-        for task in done:
-            exc = task.exception()
-            if exc is not None:
-                fatal_error = exc
-                break
-            result = task.result()
-            if result is not None:
-                results.append(result)
-        if fatal_error is not None:
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            break
-
-    if fatal_error is not None:
-        logger.error("Aborting due to pipeline failure: %s", fatal_error)
+    except PipelineAbortError as e:
+        logger.error("Aborting due to pipeline failure: %s", e)
         raise SystemExit(1)
 
     summary = {
