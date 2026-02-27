@@ -146,12 +146,41 @@ list_providers = RAGService.list_providers
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
 
     if sys.platform == "win32":
         import io
 
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+    parser = argparse.ArgumentParser(description="RAG tool quick test")
+    parser.add_argument(
+        "--kb-name",
+        default="DE-all",
+        help="Knowledge base name for test query (default: DE-all)",
+    )
+    parser.add_argument(
+        "--query",
+        default="What is this knowledge base about?",
+        help="Test query text",
+    )
+    parser.add_argument(
+        "--mode",
+        default="hybrid",
+        help="RAG mode: naive/hybrid/local/global (default: hybrid)",
+    )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="Override RAG provider id (optional)",
+    )
+    parser.add_argument(
+        "--kb-base-dir",
+        default=None,
+        help="Override KB base directory (optional)",
+    )
+    args = parser.parse_args()
 
     # List available providers
     print("Available RAG Pipelines:")
@@ -162,9 +191,11 @@ if __name__ == "__main__":
     # Test search (requires existing knowledge base)
     result = asyncio.run(
         rag_search(
-            "What is the lookup table (LUT) in FPGA?",
-            kb_name="DE-all",
-            mode="naive",
+            args.query,
+            kb_name=args.kb_name,
+            mode=args.mode,
+            provider=args.provider,
+            kb_base_dir=args.kb_base_dir,
         )
     )
 
