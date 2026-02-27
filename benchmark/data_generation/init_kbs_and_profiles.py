@@ -53,24 +53,26 @@ def _runtime_status(message: str) -> None:
     print(message, flush=True)
 
 
-def _configure_quiet_logging() -> None:
-    """Suppress noisy INFO logs from app and dependencies."""
+def _configure_logging(verbose_info: bool) -> None:
+    """Configure logging verbosity."""
+    level = logging.INFO if verbose_info else logging.WARNING
     logging.basicConfig(
-        level=logging.WARNING,
+        level=level,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-    noisy = [
-        "src",
-        "benchmark",
-        "httpx",
-        "httpcore",
-        "openai",
-        "lightrag",
-        "nano-vectordb",
-        "asyncio",
-    ]
-    for name in noisy:
-        logging.getLogger(name).setLevel(logging.WARNING)
+    if not verbose_info:
+        noisy = [
+            "src",
+            "benchmark",
+            "httpx",
+            "httpcore",
+            "openai",
+            "lightrag",
+            "nano-vectordb",
+            "asyncio",
+        ]
+        for name in noisy:
+            logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _sanitize_kb_name(name: str) -> str:
@@ -448,6 +450,11 @@ async def main() -> None:
         help='MinerU API model version (default: "vlm").',
     )
     parser.add_argument(
+        "--verbose-info",
+        action="store_true",
+        help="Enable INFO logs (disable quiet mode).",
+    )
+    parser.add_argument(
         "--gpu-ids",
         default="0,1,2,3",
         help='GPU ids for sharding workloads, comma-separated (default: "0,1,2,3").',
@@ -456,7 +463,7 @@ async def main() -> None:
     parser.add_argument("--single-kb-name", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    _configure_quiet_logging()
+    _configure_logging(verbose_info=args.verbose_info)
 
     cfg_path = Path(args.config)
     if not cfg_path.is_absolute():
