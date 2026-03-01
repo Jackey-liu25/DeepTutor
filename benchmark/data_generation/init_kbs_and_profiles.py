@@ -437,6 +437,11 @@ async def main() -> None:
         default="0,1,2,3",
         help='GPU ids for sharding workloads, comma-separated (default: "0,1,2,3").',
     )
+    parser.add_argument(
+        "--serial",
+        action="store_true",
+        help="Run in serial mode (default is parallel GPU pipeline mode).",
+    )
     parser.add_argument("--single-gpu-stage", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--single-kb-name", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -497,23 +502,50 @@ async def main() -> None:
         jobs.append((pdf, kb_name))
 
     gpu_ids = _parse_gpu_ids(args.gpu_ids)
-    _runtime_status(
-        f"Start serial run | gpus={','.join(gpu_ids[:MAX_CONCURRENCY])} | "
-        f"mode={'mineru_api' if args.use_mineru_api else 'local'} | total_pdfs={len(jobs)}"
-    )
-    results = []
-    for idx, (pdf_path, kb_name) in enumerate(jobs, start=1):
-        logger.info(
-            "Running serial pipeline [%d/%d]: %s -> %s",
-            idx,
-            len(jobs),
-            pdf_path.name,
-            kb_name,
+    if args.serial:
+        _runtime_status(
+            f"Start serial run | gpus={','.join(gpu_ids[:MAX_CONCURRENCY])} | "
+            f"mode={'mineru_api' if args.use_mineru_api else 'local'} | total_pdfs={len(jobs)}"
+        )
+        results = []
+        for idx, (pdf_path, kb_name) in enumerate(jobs, start=1):
+            logger.info(
+                "Running serial pipeline [%d/%d]: %s -> %s",
+                idx,
+                len(jobs),
+                pdf_path.name,
+                kb_name,
+            )
+            try:
+                result = await _process_pdf(
+                    pdf_path=pdf_path,
+                    kb_name=kb_name,
+                    kb_base_dir=kb_base_dir,
+                    profile_cfg=profile_cfg,
+                    rag_cfg=rag_cfg,
+                    output_dir=output_dir,
+                    skip_extract=args.skip_extract,
+                    use_mineru_api=args.use_mineru_api,
+                    mineru_api_token=args.mineru_api_token,
+                    mineru_model_version=args.mineru_model_version,
+                )
+                results.append(result)
+            except Exception as e:
+                logger.exception("Pipeline failed on %s -> %s: %s", pdf_path.name, kb_name, e)
+                _cleanup_failed_kb_data(
+                    kb_base_dir=kb_base_dir, kb_name=kb_name, output_dir=output_dir
+                )
+                raise SystemExit(1)
+    else:
+        _runtime_status(
+            f"Start parallel run | gpus={','.join(gpu_ids[:MAX_CONCURRENCY])} | "
+            f"mode={'mineru_api' if args.use_mineru_api else 'local'} | total_pdfs={len(jobs)}"
         )
         try:
-            result = await _process_pdf(
-                pdf_path=pdf_path,
-                kb_name=kb_name,
+            results = await _run_jobs_with_gpu_pipeline(
+                jobs=jobs,
+                gpu_ids=gpu_ids[:MAX_CONCURRENCY],
+                config_path=cfg_path,
                 kb_base_dir=kb_base_dir,
                 profile_cfg=profile_cfg,
                 rag_cfg=rag_cfg,
@@ -523,10 +555,8 @@ async def main() -> None:
                 mineru_api_token=args.mineru_api_token,
                 mineru_model_version=args.mineru_model_version,
             )
-            results.append(result)
-        except Exception as e:
-            logger.exception("Pipeline failed on %s -> %s: %s", pdf_path.name, kb_name, e)
-            _cleanup_failed_kb_data(kb_base_dir=kb_base_dir, kb_name=kb_name, output_dir=output_dir)
+        except PipelineAbortError as e:
+            logger.error("%s", e)
             raise SystemExit(1)
 
     summary = {

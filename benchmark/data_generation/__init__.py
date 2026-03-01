@@ -9,5 +9,6 @@
 #   - pipeline: Orchestrate the full pipeline
 
 from benchmark.data_generation.pipeline import DataGenerationPipeline
+from benchmark.data_generation.request_pipeline import main as generate_requests_main
 
-__all__ = ["DataGenerationPipeline"]
+__all__ = ["DataGenerationPipeline", "generate_requests_main"]
