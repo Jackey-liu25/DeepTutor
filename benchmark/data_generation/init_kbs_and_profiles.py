@@ -132,6 +132,54 @@ def _parse_gpu_ids(raw: str) -> list[str]:
     return ids or ["0"]
 
 
+_RAG_CRITICAL_FILES = [
+    "kv_store_text_chunks.json",
+    "kv_store_full_docs.json",
+    "kv_store_full_entities.json",
+    "kv_store_full_relations.json",
+    "vdb_chunks.json",
+    "vdb_entities.json",
+    "vdb_relationships.json",
+    "graph_chunk_entity_relation.graphml",
+]
+
+
+def _is_kb_rag_complete(kb_base_dir: Path, kb_name: str) -> bool:
+    """Check if a KB's RAG storage is fully built (all critical files present and non-empty)."""
+    rag_dir = kb_base_dir / kb_name / "rag_storage"
+    if not rag_dir.is_dir():
+        return False
+    for fname in _RAG_CRITICAL_FILES:
+        fpath = rag_dir / fname
+        if not fpath.exists() or fpath.stat().st_size == 0:
+            return False
+    # Check doc_status: all documents should be 'processed'
+    status_path = rag_dir / "kv_store_doc_status.json"
+    if status_path.exists():
+        try:
+            with open(status_path, encoding="utf-8") as f:
+                doc_status = json.load(f)
+            for doc in doc_status.values():
+                if isinstance(doc, dict) and doc.get("status") not in ("processed",):
+                    return False
+        except Exception:
+            return False
+    return True
+
+
+def _is_profile_complete(output_dir: Path, kb_name: str) -> bool:
+    """Check if profile output already exists with valid content."""
+    out_path = output_dir / f"{kb_name}.json"
+    if not out_path.exists():
+        return False
+    try:
+        with open(out_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data.get("profiles")) and bool(data.get("knowledge_scope"))
+    except Exception:
+        return False
+
+
 async def _process_pdf(
     *,
     pdf_path: Path,
@@ -145,28 +193,36 @@ async def _process_pdf(
     use_mineru_api: bool,
     mineru_api_token: str | None,
     mineru_model_version: str,
-) -> dict:
+    force: bool = False,
+) -> dict | None:
     """Initialize KB from one PDF and generate profiles."""
+    if not force and _is_profile_complete(output_dir, kb_name):
+        logger.info("SKIP (complete): %s — profile already exists", kb_name)
+        return None
+
     logger.info("=" * 70)
     logger.info("PDF: %s", pdf_path.name)
     logger.info("KB : %s", kb_name)
     logger.info("=" * 70)
 
     if not skip_processing:
-        initializer = KnowledgeBaseInitializer(
-            kb_name=kb_name,
-            base_dir=str(kb_base_dir),
-        )
-        initializer.create_directory_structure()
-        copied = initializer.copy_documents([str(pdf_path)])
-        if not copied:
-            raise RuntimeError(f"Failed to copy PDF: {pdf_path}")
+        if not force and _is_kb_rag_complete(kb_base_dir, kb_name):
+            logger.info("SKIP RAG build (complete): %s — rag_storage already built", kb_name)
+        else:
+            initializer = KnowledgeBaseInitializer(
+                kb_name=kb_name,
+                base_dir=str(kb_base_dir),
+            )
+            initializer.create_directory_structure()
+            copied = initializer.copy_documents([str(pdf_path)])
+            if not copied:
+                raise RuntimeError(f"Failed to copy PDF: {pdf_path}")
 
-        await initializer.process_documents(
-            use_mineru_api=use_mineru_api,
-            mineru_api_token=mineru_api_token,
-            mineru_model_version=mineru_model_version,
-        )
+            await initializer.process_documents(
+                use_mineru_api=use_mineru_api,
+                mineru_api_token=mineru_api_token,
+                mineru_model_version=mineru_model_version,
+            )
 
     return await _run_post_gpu_stage(
         pdf_path=pdf_path,
@@ -187,8 +243,12 @@ async def _run_gpu_stage_only(
     use_mineru_api: bool,
     mineru_api_token: str | None,
     mineru_model_version: str,
+    force: bool = False,
 ) -> None:
     """Run only GPU-heavy stage: create/copy/process documents."""
+    if not force and _is_kb_rag_complete(kb_base_dir, kb_name):
+        logger.info("SKIP GPU stage (complete): %s — rag_storage already built", kb_name)
+        return
     try:
         logger.info("=" * 70)
         logger.info("GPU stage start | PDF: %s | KB: %s", pdf_path.name, kb_name)
@@ -266,8 +326,22 @@ async def _run_jobs_with_gpu_pipeline(
     use_mineru_api: bool,
     mineru_api_token: str | None,
     mineru_model_version: str,
+    force: bool = False,
 ) -> list[dict]:
     """Run jobs with GPU-stage sharding and immediate refill."""
+    if not force:
+        original_count = len(jobs)
+        jobs = [
+            (pdf, kb) for pdf, kb in jobs
+            if not _is_profile_complete(output_dir, kb)
+        ]
+        skipped = original_count - len(jobs)
+        if skipped:
+            logger.info("Resume: skipping %d already-complete jobs", skipped)
+        if not jobs:
+            logger.info("All jobs already complete — nothing to do.")
+            return []
+
     available_gpus = list(gpu_ids)
     running: list[dict] = []
     waiting_jobs = list(jobs)
@@ -297,6 +371,8 @@ async def _run_jobs_with_gpu_pipeline(
             cmd.append("--no-use-mineru-api")
         if mineru_api_token:
             cmd.extend(["--mineru-api-token", mineru_api_token])
+        if force:
+            cmd.append("--force")
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu_id
@@ -450,6 +526,16 @@ async def main() -> None:
         action="store_true",
         help="Run in serial mode (default is parallel GPU pipeline mode).",
     )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Resume into an existing output directory instead of creating a new one.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-processing of all KBs, ignoring existing results.",
+    )
     parser.add_argument("--single-gpu-stage", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--single-kb-name", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -481,6 +567,7 @@ async def main() -> None:
             use_mineru_api=args.use_mineru_api,
             mineru_api_token=args.mineru_api_token,
             mineru_model_version=args.mineru_model_version,
+            force=args.force,
         )
         return
 
@@ -493,9 +580,17 @@ async def main() -> None:
     if not docs_dir.exists():
         raise FileNotFoundError(f"Documents dir not found: {docs_dir}")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = PROJECT_ROOT / "benchmark" / "data" / "generated" / f"profiles_from_documents_{timestamp}"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+        if not output_dir.is_absolute():
+            output_dir = (PROJECT_ROOT / output_dir).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = output_dir.name.replace("profiles_from_documents_", "")
+        logger.info("Resuming into existing output dir: %s", output_dir)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = PROJECT_ROOT / "benchmark" / "data" / "generated" / f"profiles_from_documents_{timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     pdfs = sorted(docs_dir.glob("*.pdf"))
     if args.limit and args.limit > 0:
@@ -516,6 +611,9 @@ async def main() -> None:
         )
         results = []
         for idx, (pdf_path, kb_name) in enumerate(jobs, start=1):
+            if not args.force and _is_profile_complete(output_dir, kb_name):
+                logger.info("SKIP (complete) [%d/%d]: %s", idx, len(jobs), kb_name)
+                continue
             logger.info(
                 "Running reuse-existing pipeline [%d/%d]: %s -> %s",
                 idx,
@@ -569,8 +667,10 @@ async def main() -> None:
                     use_mineru_api=args.use_mineru_api,
                     mineru_api_token=args.mineru_api_token,
                     mineru_model_version=args.mineru_model_version,
+                    force=args.force,
                 )
-                results.append(result)
+                if result is not None:
+                    results.append(result)
             except Exception as e:
                 logger.exception("Pipeline failed on %s -> %s: %s", pdf_path.name, kb_name, e)
                 _cleanup_failed_kb_data(
@@ -595,17 +695,23 @@ async def main() -> None:
                 use_mineru_api=args.use_mineru_api,
                 mineru_api_token=args.mineru_api_token,
                 mineru_model_version=args.mineru_model_version,
+                force=args.force,
             )
         except PipelineAbortError as e:
             logger.error("%s", e)
             raise SystemExit(1)
+
+    all_profiles = sorted(output_dir.glob("*.json"))
+    all_profiles = [p for p in all_profiles if p.name != "_summary.json"]
+    total_complete = len(all_profiles)
 
     summary = {
         "timestamp": timestamp,
         "docs_dir": str(docs_dir),
         "kb_base_dir": str(kb_base_dir),
         "num_pdfs": len(pdfs),
-        "num_success": len(results),
+        "num_new": len(results),
+        "num_total_complete": total_complete,
         "results": [
             {
                 "pdf_file": r["pdf_file"],
@@ -622,7 +728,7 @@ async def main() -> None:
     print("\nDone.")
     print(f"Output dir: {output_dir}")
     print(f"Summary: {summary_path}")
-    print(f"Success: {len(results)}/{len(pdfs)} PDFs")
+    print(f"This run: {len(results)} new | Total complete: {total_complete}/{len(pdfs)} PDFs")
 
 
 if __name__ == "__main__":

@@ -8,11 +8,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 CRITICAL_RAG_FILES = [
     "kv_store_text_chunks.json",
@@ -252,12 +255,53 @@ def print_report(report: dict) -> str:
     return "error" if issues else ("warn" if warnings else "ok")
 
 
-def main():
+async def _test_rag_query(kb_name: str, kb_base_dir: str, timeout: float = 60.0) -> tuple[bool, str]:
+    """Run a simple RAG query against a KB to verify it's actually usable.
+
+    Returns (success, message).
+    """
+    from src.services.rag.service import RAGService
+
+    service = RAGService(kb_base_dir=kb_base_dir)
+    query = "What is the main topic of this document?"
+    t0 = time.monotonic()
+    try:
+        result = await asyncio.wait_for(
+            service.search(query, kb_name, mode="naive", only_need_context=True),
+            timeout=timeout,
+        )
+        elapsed = time.monotonic() - t0
+        answer = (result.get("answer") or result.get("content") or "").strip()
+        if not answer:
+            return False, f"empty response ({elapsed:.1f}s)"
+        preview = answer[:80].replace("\n", " ")
+        return True, f"ok ({elapsed:.1f}s) — {preview}…"
+    except asyncio.TimeoutError:
+        return False, f"timeout (>{timeout:.0f}s)"
+    except Exception as e:
+        msg = str(e).split("\n")[0][:120]
+        return False, f"error: {msg}"
+
+
+async def main():
+    import logging
+
     parser = argparse.ArgumentParser(description="Check health of all knowledge bases")
     parser.add_argument(
         "--kb-dir",
         default="data/knowledge_bases",
         help="Path to knowledge_bases directory (default: data/knowledge_bases)",
+    )
+    parser.add_argument(
+        "--skip-rag-test",
+        action="store_true",
+        help="Skip live RAG query test (only run static checks).",
+    )
+    parser.add_argument(
+        "--rag-timeout",
+        type=float,
+        default=60.0,
+        help="Timeout in seconds for each RAG test query (default: 60).",
     )
     args = parser.parse_args()
 
@@ -297,6 +341,11 @@ def main():
     print(f"Directory: {kb_base}")
     print(f"Found {len(kb_dirs)} KB(s), {len(kb_config)} registered in kb_config.json")
 
+    # --- Phase 1: Static checks ---
+    print(f"\n{'=' * 60}")
+    print(f"{ANSI_BOLD}Phase 1: Static checks{ANSI_RESET}")
+    print(f"{'=' * 60}")
+
     groups: dict[str, list[str]] = {"ok": [], "warn": [], "error": []}
     for kb_dir in kb_dirs:
         cfg_entry = kb_config.get(kb_dir.name)
@@ -304,39 +353,100 @@ def main():
         result = print_report(report)
         groups[result].append(kb_dir.name)
 
-    # Also check for KBs in config but not on disk
     for cfg_name in kb_config:
         if not (kb_base / cfg_name).is_dir():
             print(f"\n{ANSI_RED}✗ {ANSI_BOLD}{cfg_name}{ANSI_RESET}")
             print(f"  {ANSI_RED}✗ registered in kb_config.json but directory missing{ANSI_RESET}")
             groups["error"].append(cfg_name)
 
-    # Summary
     print(f"\n{'=' * 60}")
     print(
-        f"Summary: "
+        f"Static: "
         f"{ANSI_GREEN}{len(groups['ok'])} OK{ANSI_RESET} | "
         f"{ANSI_YELLOW}{len(groups['warn'])} WARN{ANSI_RESET} | "
         f"{ANSI_RED}{len(groups['error'])} ERROR{ANSI_RESET}"
     )
 
-    if groups["ok"]:
-        print(f"\n{ANSI_GREEN}OK ({len(groups['ok'])}):{ANSI_RESET}")
-        for name in groups["ok"]:
-            print(f"  {ANSI_GREEN}✓{ANSI_RESET} {name}")
+    # --- Phase 2: Live RAG tests ---
+    candidates = groups["ok"] + groups["warn"]
+    if args.skip_rag_test or not candidates:
+        if not candidates:
+            print(f"\n{ANSI_DIM}No candidates for RAG test (all ERROR).{ANSI_RESET}")
+        # Print final lists
+        _print_final_summary(groups, rag_results=None)
+        sys.exit(1 if groups["error"] else 0)
 
-    if groups["warn"]:
-        print(f"\n{ANSI_YELLOW}WARN ({len(groups['warn'])}):{ANSI_RESET}")
-        for name in groups["warn"]:
-            print(f"  {ANSI_YELLOW}⚠{ANSI_RESET} {name}")
+    logging.disable(logging.CRITICAL)
 
-    if groups["error"]:
-        print(f"\n{ANSI_RED}ERROR ({len(groups['error'])}):{ANSI_RESET}")
-        for name in groups["error"]:
-            print(f"  {ANSI_RED}✗{ANSI_RESET} {name}")
+    print(f"\n{'=' * 60}")
+    print(f"{ANSI_BOLD}Phase 2: Live RAG query test{ANSI_RESET} ({len(candidates)} KBs, timeout={args.rag_timeout:.0f}s each)")
+    print(f"{'=' * 60}")
 
+    rag_pass: list[str] = []
+    rag_fail: list[str] = []
+
+    for i, kb_name in enumerate(candidates, 1):
+        print(f"\n  [{i}/{len(candidates)}] {kb_name} ... ", end="", flush=True)
+        ok, msg = await _test_rag_query(kb_name, str(kb_base), timeout=args.rag_timeout)
+        if ok:
+            print(f"{ANSI_GREEN}PASS{ANSI_RESET} {ANSI_DIM}{msg}{ANSI_RESET}")
+            rag_pass.append(kb_name)
+        else:
+            print(f"{ANSI_RED}FAIL{ANSI_RESET} {msg}")
+            rag_fail.append(kb_name)
+            if kb_name in groups["ok"]:
+                groups["ok"].remove(kb_name)
+                groups["error"].append(kb_name)
+            elif kb_name in groups["warn"]:
+                groups["warn"].remove(kb_name)
+                groups["error"].append(kb_name)
+
+    logging.disable(logging.NOTSET)
+
+    print(f"\n{'=' * 60}")
+    print(
+        f"RAG test: "
+        f"{ANSI_GREEN}{len(rag_pass)} PASS{ANSI_RESET} | "
+        f"{ANSI_RED}{len(rag_fail)} FAIL{ANSI_RESET}"
+    )
+
+    _print_final_summary(groups, rag_results={"pass": rag_pass, "fail": rag_fail})
     sys.exit(1 if groups["error"] else 0)
 
 
+def _print_final_summary(
+    groups: dict[str, list[str]],
+    rag_results: dict[str, list[str]] | None,
+) -> None:
+    """Print the combined final summary."""
+    print(f"\n{'=' * 60}")
+    total_ok = len(groups["ok"])
+    total_warn = len(groups["warn"])
+    total_err = len(groups["error"])
+    print(
+        f"{ANSI_BOLD}Final:{ANSI_RESET} "
+        f"{ANSI_GREEN}{total_ok} OK{ANSI_RESET} | "
+        f"{ANSI_YELLOW}{total_warn} WARN{ANSI_RESET} | "
+        f"{ANSI_RED}{total_err} ERROR{ANSI_RESET}"
+    )
+
+    usable = sorted(set(groups["ok"] + groups["warn"]))
+    if usable:
+        print(f"\n{ANSI_GREEN}{ANSI_BOLD}Usable KBs ({len(usable)}):{ANSI_RESET}")
+        for name in usable:
+            tag = ""
+            if rag_results and name in rag_results.get("pass", []):
+                tag = f" {ANSI_DIM}(RAG ✓){ANSI_RESET}"
+            print(f"  {ANSI_GREEN}✓{ANSI_RESET} {name}{tag}")
+
+    if groups["error"]:
+        print(f"\n{ANSI_RED}{ANSI_BOLD}Unusable KBs ({len(groups['error'])}):{ANSI_RESET}")
+        for name in groups["error"]:
+            tag = ""
+            if rag_results and name in rag_results.get("fail", []):
+                tag = f" {ANSI_DIM}(RAG ✗){ANSI_RESET}"
+            print(f"  {ANSI_RED}✗{ANSI_RESET} {name}{tag}")
+
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
