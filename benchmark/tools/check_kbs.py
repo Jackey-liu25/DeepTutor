@@ -430,22 +430,32 @@ def _print_final_summary(
         f"{ANSI_RED}{total_err} ERROR{ANSI_RESET}"
     )
 
-    usable = sorted(set(groups["ok"] + groups["warn"]))
-    if usable:
-        print(f"\n{ANSI_GREEN}{ANSI_BOLD}Usable KBs ({len(usable)}):{ANSI_RESET}")
-        for name in usable:
-            tag = ""
-            if rag_results and name in rag_results.get("pass", []):
-                tag = f" {ANSI_DIM}(RAG ✓){ANSI_RESET}"
-            print(f"  {ANSI_GREEN}✓{ANSI_RESET} {name}{tag}")
+    if rag_results:
+        rp = sorted(rag_results.get("pass", []))
+        rf = sorted(rag_results.get("fail", []))
+        if rp:
+            print(f"\n{ANSI_GREEN}{ANSI_BOLD}RAG OK ({len(rp)}):{ANSI_RESET}")
+            for name in rp:
+                print(f"  {ANSI_GREEN}✓{ANSI_RESET} {name}")
+        if rf:
+            print(f"\n{ANSI_RED}{ANSI_BOLD}RAG FAIL ({len(rf)}):{ANSI_RESET}")
+            for name in rf:
+                print(f"  {ANSI_RED}✗{ANSI_RESET} {name}")
+
+    if groups["ok"]:
+        print(f"\n{ANSI_GREEN}Static OK ({len(groups['ok'])}):{ANSI_RESET}")
+        for name in sorted(groups["ok"]):
+            print(f"  {ANSI_GREEN}✓{ANSI_RESET} {name}")
+
+    if groups["warn"]:
+        print(f"\n{ANSI_YELLOW}Static WARN ({len(groups['warn'])}):{ANSI_RESET}")
+        for name in sorted(groups["warn"]):
+            print(f"  {ANSI_YELLOW}⚠{ANSI_RESET} {name}")
 
     if groups["error"]:
-        print(f"\n{ANSI_RED}{ANSI_BOLD}Unusable KBs ({len(groups['error'])}):{ANSI_RESET}")
-        for name in groups["error"]:
-            tag = ""
-            if rag_results and name in rag_results.get("fail", []):
-                tag = f" {ANSI_DIM}(RAG ✗){ANSI_RESET}"
-            print(f"  {ANSI_RED}✗{ANSI_RESET} {name}{tag}")
+        print(f"\n{ANSI_RED}Static ERROR ({len(groups['error'])}):{ANSI_RESET}")
+        for name in sorted(groups["error"]):
+            print(f"  {ANSI_RED}✗{ANSI_RESET} {name}")
 
 
 if __name__ == "__main__":
