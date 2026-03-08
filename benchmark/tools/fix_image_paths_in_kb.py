@@ -23,6 +23,7 @@ import json
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +40,12 @@ ANSI_BOLD = "\033[1m"
 
 TARGET_SUBDIRS = ("auto/images", "docling/images", "content_list")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+_TARGET_HINTS_LOWER = tuple(x.lower() for x in TARGET_SUBDIRS)
+_STALE_IMAGE_PATH_RE = re.compile(
+    r'([^\s"\'<>]*?(?:content_list|auto/images|docling/images)[^\s"\'<>]*?'
+    r'(?:\.png|\.jpg|\.jpeg|\.webp|\.gif|\.bmp))',
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass
@@ -73,12 +80,10 @@ def _rewrite_embedded_paths(value: str, images_dir: Path, stats: dict[str, int])
       "Image Path: /.../content_list/.../auto/images/abc.jpg"
       -> "Image Path: /.../knowledge_bases/<kb>/images/abc.jpg"
     """
-    # Match path-like substrings that include stale dirs and an image filename.
-    pattern = re.compile(
-        r'([^\s"\'<>]*?(?:content_list|auto/images|docling/images)[^\s"\'<>]*?'
-        r'(?:\.png|\.jpg|\.jpeg|\.webp|\.gif|\.bmp))',
-        flags=re.IGNORECASE,
-    )
+    # Fast-path: skip regex for most strings.
+    lower = value.lower()
+    if not any(h in lower for h in _TARGET_HINTS_LOWER):
+        return value
 
     def _replace(match: re.Match[str]) -> str:
         old = match.group(1)
@@ -91,7 +96,7 @@ def _rewrite_embedded_paths(value: str, images_dir: Path, stats: dict[str, int])
             return str(candidate.resolve())
         return old
 
-    return pattern.sub(_replace, value)
+    return _STALE_IMAGE_PATH_RE.sub(_replace, value)
 
 
 def _maybe_rewrite_path(value: str, images_dir: Path, stats: dict[str, int]) -> str:
@@ -234,18 +239,21 @@ def main() -> None:
             continue
 
         kb_changed = kb_replaced = kb_errors = 0
-        for path in targets:
+        for idx, path in enumerate(targets, start=1):
+            print(f"  {ANSI_DIM}→ [{idx}/{len(targets)}] scanning {path.name}{ANSI_RESET}")
+            started = time.time()
             r = _fix_one_json(
                 path=path,
                 images_dir=images_dir,
                 dry_run=args.dry_run,
                 backup=not args.no_backup,
             )
+            elapsed = time.time() - started
             total_files += 1
             if r.error:
                 kb_errors += 1
                 total_errors += 1
-                print(f"  {ANSI_RED}✗{ANSI_RESET} {path.name}: {r.error}")
+                print(f"  {ANSI_RED}✗{ANSI_RESET} {path.name}: {r.error} ({elapsed:.1f}s)")
                 continue
             if r.changed:
                 kb_changed += 1
@@ -254,8 +262,10 @@ def main() -> None:
                 total_replaced += r.replaced_strings
                 print(
                     f"  {ANSI_GREEN}✓{ANSI_RESET} {path.name}: replaced {r.replaced_strings}"
-                    f" {ANSI_DIM}(scanned={r.scanned_strings}){ANSI_RESET}"
+                    f" {ANSI_DIM}(scanned={r.scanned_strings}, {elapsed:.1f}s){ANSI_RESET}"
                 )
+            else:
+                print(f"  {ANSI_DIM}- {path.name}: no change ({elapsed:.1f}s){ANSI_RESET}")
 
         if kb_changed == 0 and kb_errors == 0:
             print(f"  {ANSI_DIM}- no stale paths rewritten{ANSI_RESET}")
