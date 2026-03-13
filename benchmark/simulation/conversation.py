@@ -248,7 +248,32 @@ _TUTOR_INSTRUCTION_BASE = (
     "You are a helpful and patient tutor."
 )
 
-_HISTORY_CHAR_BUDGET = 2000
+_HISTORY_CHAR_BUDGET = 10000
+
+
+def _build_history_entries(
+    tutor_history: list[dict[str, str]],
+    *,
+    char_budget: int,
+) -> list[str]:
+    """Render recent tutor/student history within a character budget."""
+    if not tutor_history or char_budget <= 0:
+        return []
+
+    lines: list[str] = []
+    total = 0
+    for msg in reversed(tutor_history):
+        role = "Student" if msg.get("role") == "user" else "Tutor"
+        text = (msg.get("content", "") or "").strip()
+        if not text:
+            continue
+        entry = f"[{role}] {text}"
+        if total + len(entry) > char_budget:
+            break
+        lines.append(entry)
+        total += len(entry)
+    lines.reverse()
+    return lines
 
 
 def _build_conversation_context(tutor_history: list[dict[str, str]]) -> str:
@@ -258,23 +283,12 @@ def _build_conversation_context(tutor_history: list[dict[str, str]]) -> str:
     can adapt to the student's expressed confusion and level without
     exposing any private profile data.
     """
-    if not tutor_history:
-        return ""
-    lines: list[str] = []
-    total = 0
-    for msg in reversed(tutor_history):
-        role = "Student" if msg.get("role") == "user" else "Tutor"
-        text = (msg.get("content", "") or "").strip()
-        if not text:
-            continue
-        entry = f"[{role}] {text}"
-        if total + len(entry) > _HISTORY_CHAR_BUDGET:
-            break
-        lines.append(entry)
-        total += len(entry)
+    lines = _build_history_entries(
+        tutor_history,
+        char_budget=_HISTORY_CHAR_BUDGET,
+    )
     if not lines:
         return ""
-    lines.reverse()
     return (
         "## Conversation so far\n"
         + "\n".join(lines)
@@ -389,14 +403,13 @@ def _build_practice_preferences(
         "- Distractors must NOT be obviously wrong at first glance.\n"
         "- Keep options balanced in style and length to avoid test-taking shortcuts.\n"
     )
-    if not tutor_history:
+    lines = _build_history_entries(
+        tutor_history,
+        char_budget=_HISTORY_CHAR_BUDGET,
+    )
+    if not lines:
         return quality_rules
-    convo_lines = []
-    for msg in tutor_history[-16:]:
-        role = "Student" if msg.get("role") == "user" else "Tutor"
-        text = (msg.get("content", "") or "")[:300]
-        convo_lines.append(f"[{role}] {text}")
-    return quality_rules + "\nRecent conversation:\n" + "\n".join(convo_lines)
+    return quality_rules + "\nRecent conversation:\n" + "\n".join(lines)
 
 
 async def deep_tutor_generate_practice_questions(

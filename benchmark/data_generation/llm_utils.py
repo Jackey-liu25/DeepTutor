@@ -47,6 +47,63 @@ def _cleanup_json_candidate(candidate: str) -> str:
     return s
 
 
+def _repair_incomplete_json_object(text: str) -> str:
+    """Best-effort repair for truncated JSON object text.
+
+    Strategy:
+    - Keep content from the first '{' onward (object-only fallback path).
+    - Track string/escape states while balancing {} and [].
+    - If output ends inside a string, close it.
+    - Append missing closing brackets/braces.
+    - Remove trailing commas before closers.
+    """
+    s = _normalize_json_like_text(text)
+    start = s.find("{")
+    if start == -1:
+        return ""
+    s = s[start:]
+
+    out: list[str] = []
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+
+    for ch in s:
+        out.append(ch)
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in "{[":
+            stack.append(ch)
+            continue
+        if ch in "}]":
+            if stack:
+                top = stack[-1]
+                if (top == "{" and ch == "}") or (top == "[" and ch == "]"):
+                    stack.pop()
+            continue
+
+    repaired = "".join(out)
+    if in_string:
+        repaired += '"'
+
+    for opener in reversed(stack):
+        repaired += "}" if opener == "{" else "]"
+
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    return repaired
+
+
 def _yield_json_candidates(text: str):
     """Yield likely JSON substrings from noisy LLM output."""
     t = _normalize_json_like_text(text)
@@ -195,6 +252,22 @@ def extract_json(text: str) -> dict:
             and isinstance(parsed[0], dict)
         ):
             return parsed[0]
+
+    # Final fallback: repair likely-truncated object and parse once.
+    repaired = _repair_incomplete_json_object(normalized)
+    if repaired:
+        try:
+            parsed = json.loads(repaired)
+            if isinstance(parsed, dict):
+                return parsed
+            if (
+                isinstance(parsed, list)
+                and len(parsed) == 1
+                and isinstance(parsed[0], dict)
+            ):
+                return parsed[0]
+        except Exception as e:
+            last_error = e
 
     preview = normalized[:240].replace("\n", "\\n")
     msg = f"Cannot extract JSON from LLM response (preview='{preview}')"
