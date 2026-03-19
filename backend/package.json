@@ -1,0 +1,14 @@
+{
+  "name": "deeptutor-backend",
+  "version": "1.0.0",
+  "description": "DeepTutor Backend - OpenAI to Anthropic API adapter",
+  "main": "start_backend.py",
+  "scripts": {
+    "start": "python start_backend.py"
+  },
+  "dependencies": [],
+  "build": "pip install --no-cache-dir -r requirements_render.txt",
+  "engines": {
+    "python": "3.11"
+  }
+}
