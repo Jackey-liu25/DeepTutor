@@ -1,6 +1,11 @@
 /** @type {import('next').NextConfig} */
 
 const nextConfig = {
+  // Inject API base URL at build time
+  env: {
+    NEXT_PUBLIC_API_BASE: process.env.NEXT_PUBLIC_API_BASE || "https://deeptutor-backend.up.railway.app",
+  },
+
   // Move dev indicator to bottom-right corner
   devIndicators: {
     position: "bottom-right",
